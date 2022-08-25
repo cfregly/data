@@ -20,6 +20,12 @@ T_co = TypeVar("T_co", covariant=True)
 SERIALIZED_DATAPIPE_KEY_NAME = "serialized_datapipe"
 READING_SERVICE_STATE_KEY_NAME = "reading_service_state"
 
+_DL2_length_exception = RuntimeError(
+    "Unable to retrieve the length of the DataPipe. This may be caused by operations,"
+    "such as `filter`, of which the output length cannot be known in advance."
+    "We recommend manually tagging the correct length with `datapipe.set_length(length)`."
+)
+
 
 def serialize_datapipe(datapipe: DataPipe) -> bytes:
     try:
@@ -78,6 +84,9 @@ class DataLoader2Iterator(Iterator):
             raise AttributeError
         return getattr(self.dataloader._datapipe_iter, name)
 
+    def __len__(self):
+        return len(self.dataloader)
+
 
 class DataLoader2(Generic[T_co]):
     """
@@ -112,6 +121,7 @@ class DataLoader2(Generic[T_co]):
             self.datapipe_adapter_fns = [datapipe_adapter_fn]
         self.reading_service = self._copy(reading_service)
         self.reading_service_state: Optional[bytes] = None  # is not `None` when `load_state_dict` is called
+        self._initialized: bool = False
         self._terminated: bool = False
         self.valid_iterator_id: Optional[int] = None
 
@@ -120,28 +130,48 @@ class DataLoader2(Generic[T_co]):
                 self.datapipe = adapter_fn(self.datapipe)
         self._datapipe_before_reading_service_adapt: DataPipe = self.datapipe
 
+    def _initialize_iteration(self):
+        if not self._adapted and self.reading_service is not None:
+            if self.reading_service_state is None:
+                self.datapipe = self.reading_service.initialize(self.datapipe)
+            else:
+                if not isinstance(self.reading_service, CheckpointableReadingServiceInterface):
+                    raise TypeError("Cannot restore from non-checkpointable reading service")
+                self.datapipe = self.reading_service.restore(self.datapipe, self.reading_service_state)
+            self._adapted = True
+
+        if self.reading_service is not None:
+            self.reading_service.initialize_iteration()
+
+        self._datapipe_iter = iter(self.datapipe)
+        self._reset_iter = False
+        self._initialized = True
+
     def __iter__(self) -> Iterator[T_co]:
         if self._terminated:
             raise Exception("Cannot iterate over the DataLoader as it has already been shut down")
 
         if self._reset_iter:
-            if not self._adapted and self.reading_service is not None:
-                if self.reading_service_state is None:
-                    self.datapipe = self.reading_service.initialize(self.datapipe)
-                else:
-                    if not isinstance(self.reading_service, CheckpointableReadingServiceInterface):
-                        raise TypeError("Cannot restore from non-checkpointable reading service")
-                    self.datapipe = self.reading_service.restore(self.datapipe, self.reading_service_state)
-                self._adapted = True
-
-            if self.reading_service is not None:
-                self.reading_service.initialize_iteration()
-
-            self._datapipe_iter = iter(self.datapipe)
-            self._reset_iter = False
+            self._initialize_iteration()
 
         self.valid_iterator_id = 0 if self.valid_iterator_id is None else self.valid_iterator_id + 1
         return DataLoader2Iterator(self, self.valid_iterator_id)
+
+    def __len__(self) -> int:
+        if self.reading_service is None:
+            try:
+                return len(self.datapipe)
+            except TypeError:
+                raise _DL2_length_exception
+
+        length = self.reading_service.get_datapipe_length()
+        if length is None:
+            if not self._initialized:
+                self._initialize_iteration()
+                length = self.reading_service.get_datapipe_length()
+                if length is None:
+                    raise _DL2_length_exception
+        return length  # type: ignore[return-value]
 
     def __del__(self) -> None:
         self.shutdown()
